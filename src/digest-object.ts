@@ -7,6 +7,12 @@ import { sendDigestEmail, sendConfirmationEmail } from "./resend";
 const MAX_DIGESTS = 30;
 const DIGEST_CONTEXT_COUNT = 3;
 const SEND_HOUR = 8; // 8am in user's local timezone
+const MAX_TOPICS = 20;
+const MAX_TOPIC_LENGTH = 200;
+
+function isValidEmail(email: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 254;
+}
 
 export class DigestObject extends YServer<Env> {
   private lastKnownEmail: string | null = null;
@@ -43,6 +49,10 @@ export class DigestObject extends YServer<Env> {
     // Sync to Yjs for client display
     this.syncConfirmedToYjs();
 
+    // Load persisted rate limits from KV
+    this.lastVerificationSentAt = (await this.ctx.storage.get<number>("lastVerificationSentAt")) ?? 0;
+    this.lastDigestGeneratedAt = (await this.ctx.storage.get<number>("lastDigestGeneratedAt")) ?? 0;
+
     // Backfill nextAlarmTime for existing alarms
     const existingAlarm = await this.ctx.storage.getAlarm();
     if (existingAlarm) {
@@ -54,6 +64,11 @@ export class DigestObject extends YServer<Env> {
       }
     }
 
+    // Watch topics array for bounds enforcement
+    this.document.getArray("topics").observe(() => {
+      this.enforceTopicBounds();
+    });
+
     // Watch config changes for alarm scheduling + email change detection
     this.document.getMap("config").observe(() => {
       this.enforceServerFields();
@@ -63,6 +78,25 @@ export class DigestObject extends YServer<Env> {
       this.checkEmailChanged().catch((e) =>
         console.error("Email change check error:", e)
       );
+    });
+  }
+
+  /** Trim topics array if it exceeds bounds */
+  private enforceTopicBounds(): void {
+    const arr = this.document.getArray("topics");
+    this.document.transact(() => {
+      // Trim excess topics
+      while (arr.length > MAX_TOPICS) {
+        arr.delete(arr.length - 1, 1);
+      }
+      // Truncate overly long topic strings
+      for (let i = 0; i < arr.length; i++) {
+        const val = arr.get(i) as string;
+        if (typeof val === "string" && val.length > MAX_TOPIC_LENGTH) {
+          arr.delete(i, 1);
+          arr.insert(i, [val.slice(0, MAX_TOPIC_LENGTH)]);
+        }
+      }
     });
   }
 
@@ -101,6 +135,13 @@ export class DigestObject extends YServer<Env> {
   private async checkEmailChanged(): Promise<void> {
     const currentEmail = this.getEmail();
     if (currentEmail !== this.lastKnownEmail) {
+      // Validate new email — revert if invalid
+      if (currentEmail && !isValidEmail(currentEmail)) {
+        this.document.transact(() => {
+          this.document.getMap("config").set("email", this.lastKnownEmail ?? "");
+        });
+        return;
+      }
       this.lastKnownEmail = currentEmail;
       // Email changed — reset confirmation and invalidate token
       if (this.isConfirmed()) {
@@ -127,7 +168,9 @@ export class DigestObject extends YServer<Env> {
   }
 
   private getTopics(): string[] {
-    return this.document.getArray("topics").toArray() as string[];
+    return (this.document.getArray("topics").toArray() as string[])
+      .slice(0, MAX_TOPICS)
+      .map((t) => (typeof t === "string" ? t.slice(0, MAX_TOPIC_LENGTH) : ""));
   }
 
   private getDigests(): Digest[] {
@@ -302,6 +345,7 @@ export class DigestObject extends YServer<Env> {
     );
     if (!result.success) console.error("Verification email failed:", result.error);
     this.lastVerificationSentAt = now;
+    await this.ctx.storage.put("lastVerificationSentAt", now);
   }
 
   private async runDigest(): Promise<Digest> {
@@ -369,6 +413,7 @@ export class DigestObject extends YServer<Env> {
             throw new Error("Please wait 60 seconds between digest generations");
           }
           this.lastDigestGeneratedAt = now;
+          await this.ctx.storage.put("lastDigestGeneratedAt", now);
           // Send immediate ack, run digest in background so the DO stays responsive
           this.sendCustomMessage(
             connection,
@@ -415,6 +460,10 @@ export class DigestObject extends YServer<Env> {
     // Path: /parties/digest-object/:uuid/unsubscribe
     if (url.pathname.endsWith("/unsubscribe")) {
       if (request.method === "POST") {
+        const origin = request.headers.get("origin");
+        if (origin && origin !== url.origin) {
+          return new Response("Forbidden", { status: 403 });
+        }
         this.document.transact(() => {
           this.document.getMap("config").set("frequency", "manual");
         });

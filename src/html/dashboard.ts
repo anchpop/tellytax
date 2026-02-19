@@ -9,7 +9,7 @@ export function dashboardPage(id: string): string {
 </head>
 <body>
   <div id="root"></div>
-  <script>const DIGEST_ID = "${id}";</script>
+  <script>const DIGEST_ID = ${JSON.stringify(id)};</script>
   <script type="module" src="/client.js"></script>
 </body>
 </html>`;

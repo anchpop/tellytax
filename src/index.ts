@@ -6,7 +6,7 @@ import { dashboardPage } from "./html/dashboard";
 export { DigestObject } from "./digest-object";
 
 function digestCookie(id: string): string {
-  return `digest_id=${id}; Path=/; Max-Age=${60 * 60 * 24 * 365}; SameSite=Lax; Secure`;
+  return `digest_id=${id}; Path=/; Max-Age=${60 * 60 * 24 * 365}; SameSite=Lax; Secure; HttpOnly`;
 }
 
 function getDigestIdFromCookie(request: Request): string | null {
@@ -31,6 +31,10 @@ export default {
 
     // Create new digest — just generate a UUID, DO is created lazily on connect
     if (path === "/api/create" && method === "POST") {
+      const ct = request.headers.get("content-type") ?? "";
+      if (!ct.includes("application/json")) {
+        return new Response("Content-Type must be application/json", { status: 415 });
+      }
       const id = crypto.randomUUID();
       return Response.json({ id }, {
         headers: { "set-cookie": digestCookie(id) },

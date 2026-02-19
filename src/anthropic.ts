@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { marked } from "marked";
+import sanitizeHtml from "sanitize-html";
 import type { Digest, DigestSection, DigestSource } from "./types";
 
 export async function generateDigest(
@@ -277,5 +278,18 @@ function escapeHtml(s: string): string {
 }
 
 function markdownToHtml(text: string): string {
-  return marked.parse(text, { async: false }) as string;
+  const raw = marked.parse(text, { async: false }) as string;
+  return sanitizeHtml(raw, {
+    allowedTags: [
+      "p", "br", "a", "strong", "em", "b", "i",
+      "ul", "ol", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+      "blockquote", "code", "pre", "hr", "div", "span",
+    ],
+    allowedAttributes: {
+      a: ["href", "style", "class"],
+      div: ["style", "class"],
+      span: ["style", "class"],
+      p: ["style", "class"],
+    },
+  });
 }
