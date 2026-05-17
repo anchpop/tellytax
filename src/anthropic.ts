@@ -151,7 +151,7 @@ async function generateFunFact(
   try {
     const response = await client.beta.messages.create({
       model: "claude-sonnet-4-6",
-      max_tokens: 300,
+      max_tokens: 1024,
       betas: ["web-fetch-2025-09-10"],
       tools: [
         {
@@ -181,7 +181,7 @@ Respond with ONLY the fun fact itself — one or two sentences, no preamble, no 
       // Tool use happened, need to continue
       const response2 = await client.beta.messages.create({
         model: "claude-sonnet-4-6",
-        max_tokens: 300,
+        max_tokens: 1024,
         betas: ["web-fetch-2025-09-10"],
         tools: [
           {
