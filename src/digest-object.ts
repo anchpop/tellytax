@@ -269,15 +269,46 @@ export class DigestObject extends YServer<Env> {
     const shouldReschedule = this.isEnabled() && this.getFrequency() !== "manual";
     if (shouldReschedule) {
       await this.scheduleNextAlarm();
+    } else {
+      // Stale or at-least-once alarm after the user disabled scheduling —
+      // don't generate or email anything.
+      return;
     }
     if (!this.isConfirmed() || !this.roomName) {
       if (!this.roomName) console.error("Alarm fired but room name unknown — skipping digest");
       return;
     }
     // Run digest in background so the DO can still handle WebSocket connections
-    this.ctx.waitUntil(
-      this.runDigest().catch((e) => console.error("Alarm digest failed:", e))
-    );
+    this.ctx.waitUntil(this.runScheduledDigest());
+  }
+
+  private static readonly MAX_DIGEST_RETRIES = 2;
+  private static readonly DIGEST_RETRY_DELAY_MS = 60 * 60 * 1000; // 1 hour
+
+  /** Run the scheduled digest; on failure, retry via a short alarm (up to MAX_DIGEST_RETRIES). */
+  private async runScheduledDigest(): Promise<void> {
+    try {
+      await this.runDigest();
+      await this.ctx.storage.put("digestRetryCount", 0);
+    } catch (e) {
+      console.error("Alarm digest failed:", e);
+      // Don't schedule a retry if the user disabled or unsubscribed mid-run —
+      // a retry alarm would resurrect a schedule syncAlarmState() tore down.
+      if (!this.isEnabled() || this.getFrequency() === "manual") return;
+      const retryCount =
+        (await this.ctx.storage.get<number>("digestRetryCount")) ?? 0;
+      if (retryCount >= DigestObject.MAX_DIGEST_RETRIES) {
+        // Give up until the next regular schedule (already set by onAlarm).
+        await this.ctx.storage.put("digestRetryCount", 0);
+        return;
+      }
+      await this.ctx.storage.put("digestRetryCount", retryCount + 1);
+      const retryAt = Date.now() + DigestObject.DIGEST_RETRY_DELAY_MS;
+      await this.ctx.storage.setAlarm(retryAt);
+      this.document.transact(() => {
+        this.document.getMap("config").set("nextAlarmTime", retryAt);
+      });
+    }
   }
 
   // --- Digest generation ---

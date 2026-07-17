@@ -10,7 +10,7 @@ export async function generateDigest(
   dashboardUrl: string,
   previousFunFacts: string[] = []
 ): Promise<Digest> {
-  const model = "claude-sonnet-4-6";
+  const model = "claude-sonnet-5";
   const client = new Anthropic({ apiKey });
   const today = new Date().toISOString().split("T")[0];
 
@@ -48,34 +48,31 @@ Rules:
 - Do not use underscores in markdown.${previousContext}`;
 
   let fullText = "";
-  let stopReason: string | null = null;
   const citationMap = new Map<string, string>(); // url -> title
   let messages: Anthropic.MessageParam[] = [
     { role: "user", content: "Research and generate today's digest." },
   ];
 
-  while (true) {
-    const response = await client.beta.messages.create({
+  const MAX_CONTINUATIONS = 5;
+  for (let turn = 0; turn <= MAX_CONTINUATIONS; turn++) {
+    const response = await client.messages.create({
       model,
       max_tokens: 16000,
       system: systemPrompt,
-      betas: ["web-fetch-2025-09-10"],
       tools: [
         {
-          type: "web_search_20250305",
+          type: "web_search_20260209",
           name: "web_search",
           max_uses: 30,
         },
         {
-          type: "web_fetch_20250910",
+          type: "web_fetch_20260209",
           name: "web_fetch",
           max_uses: 30,
         },
       ],
       messages,
     });
-
-    stopReason = response.stop_reason;
 
     for (const block of response.content) {
       if (block.type === "text") {
@@ -97,14 +94,19 @@ Rules:
       }
     }
 
-    if (stopReason === "pause_turn") {
-      messages = [
-        ...messages,
-        { role: "assistant", content: response.content },
-        { role: "user", content: "Please continue." },
-      ];
-      fullText = "";
-      citationMap.clear();
+    if (response.stop_reason === "pause_turn") {
+      // Server-side tool loop paused. Re-send with the assistant turn appended —
+      // the API detects the trailing server_tool_use and resumes automatically.
+      // Text and citations accumulated so far are kept.
+      if (turn === MAX_CONTINUATIONS) {
+        throw new Error(
+          `Digest generation still paused after ${MAX_CONTINUATIONS} continuations`
+        );
+      }
+      messages = [...messages, { role: "assistant", content: response.content }];
+    } else if (response.stop_reason !== "end_turn") {
+      // max_tokens = truncated output, refusal = partial/empty — don't email it.
+      throw new Error(`Digest generation stopped with ${response.stop_reason}`);
     } else {
       break;
     }
@@ -129,6 +131,18 @@ Rules:
     sections.push({ title: headings[i].title, content });
   }
 
+  // Fallback: if the model drifted from the expected format, don't send an
+  // empty email — use the whole response (minus the subject line) as one section.
+  if (sections.length === 0) {
+    const body = fullText.replace(/^subject:\s*.+$/im, "").trim();
+    if (body) sections.push({ title: "Today's Digest", content: body });
+  }
+
+  // Never store/email an empty shell.
+  if (!sections.some((s) => s.content.trim().length > 0)) {
+    throw new Error("Digest generation produced no content");
+  }
+
   const sources: DigestSource[] = Array.from(citationMap, ([url, title]) => ({ url, title }));
 
   // Generate a fun fact in a separate request (max 3 web searches)
@@ -148,58 +162,50 @@ async function generateFunFact(
     ? `\n\nPrevious fun facts (DO NOT repeat any of these):\n${previousFunFacts.map((f, i) => `${i + 1}. ${f}`).join("\n")}`
     : "";
 
-  try {
-    const response = await client.beta.messages.create({
-      model: "claude-sonnet-4-6",
-      max_tokens: 1024,
-      betas: ["web-fetch-2025-09-10"],
-      tools: [
-        {
-          type: "web_search_20250305" as any,
-          name: "web_search",
-          max_uses: 3,
-        },
-      ],
-      system: `You are a fun fact researcher. The user is interested in: ${topics.join(", ")}.
+  const system = `You are a fun fact researcher. The user is interested in: ${topics.join(", ")}.
 
 Pick ONE of these topics at random and find an obscure, surprising fun fact related to it. The reader is knowledgeable and motivated — avoid anything obvious or well-known. Dig for something genuinely surprising: a weird historical connection, a counterintuitive statistic, a strange origin story, an obscure record, etc.
 
 Be varied across calls — rotate topics, alternate between historical facts, science facts, cultural trivia, statistics, etc.${previousContext}
 
-Respond with ONLY the fun fact itself — one or two sentences, no preamble, no "Fun fact:" prefix, no quotation marks.`,
-      messages: [
-        { role: "user", content: "Find me an interesting fun fact." },
-      ],
-    });
+Respond with ONLY the fun fact itself — one or two sentences, no preamble, no "Fun fact:" prefix, no quotation marks.`;
 
+  try {
     let text = "";
-    for (const block of response.content) {
-      if (block.type === "text") text += block.text;
-    }
+    let messages: Anthropic.MessageParam[] = [
+      { role: "user", content: "Find me an interesting fun fact." },
+    ];
 
-    if (response.stop_reason === "pause_turn") {
-      // Tool use happened, need to continue
-      const response2 = await client.beta.messages.create({
-        model: "claude-sonnet-4-6",
+    const MAX_CONTINUATIONS = 3;
+    for (let turn = 0; turn <= MAX_CONTINUATIONS; turn++) {
+      const response = await client.messages.create({
+        model: "claude-sonnet-5",
         max_tokens: 1024,
-        betas: ["web-fetch-2025-09-10"],
         tools: [
           {
-            type: "web_search_20250305" as any,
+            type: "web_search_20260209",
             name: "web_search",
-            max_uses: 0,
+            max_uses: 3,
           },
         ],
-        system: `Respond with ONLY the fun fact — one or two sentences, no preamble.`,
-        messages: [
-          { role: "user", content: "Find me an interesting fun fact." },
-          { role: "assistant", content: response.content },
-          { role: "user", content: "Please give me the fun fact now." },
-        ],
+        system,
+        messages,
       });
-      text = "";
-      for (const block of response2.content) {
+
+      for (const block of response.content) {
         if (block.type === "text") text += block.text;
+      }
+
+      if (response.stop_reason === "pause_turn") {
+        if (turn === MAX_CONTINUATIONS) {
+          throw new Error("Fun fact generation still paused after max continuations");
+        }
+        // Append the assistant turn and re-send — the API resumes automatically.
+        messages = [...messages, { role: "assistant", content: response.content }];
+      } else if (response.stop_reason !== "end_turn") {
+        throw new Error(`Fun fact generation stopped with ${response.stop_reason}`);
+      } else {
+        break;
       }
     }
 
